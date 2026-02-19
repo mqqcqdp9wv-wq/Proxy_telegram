@@ -159,7 +159,7 @@ def send_telegram_message(message):
     # We use editMessageText because we want to update the SAME post forever
     # But if we can't find it, we fallback to sending a new one (auto-recovery)
     # The 'Eternal Post' ID is hardcoded here based on previous successful run
-    ETERNAL_MESSAGE_ID = 3 
+    ETERNAL_MESSAGE_ID = 2 
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {
