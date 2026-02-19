@@ -1,21 +1,18 @@
+import asyncio
 import os
 import requests
 import socket
 import time
 from urllib.parse import quote
 from urllib.parse import urlparse, parse_qs
-import asyncio
-from telethon import TelegramClient, connection
-from telethon.sessions import StringSession
 
 # Configuration
 PROXY_LIST_URL = "https://raw.githubusercontent.com/Argh94/Proxy-List/main/MTProto.txt"
+# CHAT_ID is hardcoded in send_telegram_message below, so we don't strictly need it here as ENV
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# CHAT_ID is hardcoded in send_telegram_message, so we don't strictly need it here, but good practice
-CHAT_ID_ENV = os.environ.get("CHAT_ID") 
 
-CHECK_TIMEOUT = 5  # Seconds to wait for a connection
-MAX_PROXIES_TO_CHECK = 100 # Check fewer proxies but deeper
+CHECK_TIMEOUT = 10  
+MAX_PROXIES_TO_CHECK = 1000 # Check ALL proxies
 MAX_PROXIES_TO_SEND = 5
 
 def get_proxies():
@@ -51,80 +48,103 @@ def parse_tg_link(link):
     except Exception:
         return None
 
-async def check_proxy_telethon(proxy_link):
+async def check_proxy_socket(proxy_link):
     """
-    Check if a proxy works by trying to connect using Telethon.
+    Check if a proxy works using raw socket (Heuristic MTProto Handshake).
+    Authentication is skipped, we only check if it accepts MTProto-like packets.
     """
     parsed = parse_tg_link(proxy_link)
     if not parsed:
-        return False, 0
+        return False, 0, proxy_link, None
     
-    request_server, request_port, request_secret = parsed
-    
-    # Telethon proxy format
-    proxy = (connection.ConnectionTcpMTProxyRandomizedIntermediate, request_server, request_port, request_secret)
-    
-    # Use standard public API ID (not secret, widely used for open source)
-    api_id = 2040
-    api_hash = 'b18441a1ff607e10a989891a5462e627'
-    
-    client = TelegramClient(StringSession(), api_id, api_hash, proxy=proxy, timeout=CHECK_TIMEOUT)
+    host, port, secret = parsed
     
     try:
         start_time = time.time()
-        await client.connect()
-        if await client.is_user_authorized() or not await client.is_user_authorized(): 
-            # We just care if connect() succeeded without error.
-            # Usually connect() returns successful if handshake is done.
-            # We can also try get_me() but that requires valid auth key which we don't have/want.
-            # Just 'connect()' verifies handshake and network.
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), 
+            timeout=CHECK_TIMEOUT
+        )
+        
+        # Send 64 bytes of random data (Simulate Obfuscated Header)
+        # Most FakeTLS proxies (`ee` secret) will accept this or wait for more.
+        # Dead/Fake proxies usually close connection immediately or timeout on connect.
+        random_payload = os.urandom(64)
+        writer.write(random_payload)
+        await writer.drain()
+        
+        # Try to read 1 byte with a short timeout
+        # If it returns 0 bytes -> Closed connection -> Bad
+        # If it timeouts -> Connection stays open -> Likely Good (waiting for more data)
+        # If it returns data -> Good (protocol response)
+        try:
+            # We give it 2 seconds to "reject" us. If it doesn't reject, it's alive.
+            data = await asyncio.wait_for(reader.read(1), timeout=2.0)
+            if not data:
+                writer.close()
+                await writer.wait_closed()
+                return False, 0, proxy_link, host # Connection closed
+        except asyncio.TimeoutError:
+            # Timeout is GOOD here! It means server accepted connection and is waiting.
             pass
-            
-        latency = (time.time() - start_time) * 1000
-        await client.disconnect()
-        return True, latency
-    except Exception as e:
-        # print(f"Failed: {request_server} - {e}")
-        await client.disconnect()
-        return False, 0
+        except Exception:
+             writer.close()
+             await writer.wait_closed()
+             return False, 0, proxy_link, host
 
-def check_proxies_sync(proxies):
-    """Wrapper to run async checks."""
+        latency = (time.time() - start_time) * 1000
+        writer.close()
+        await writer.wait_closed()
+        return True, latency, proxy_link, host
+        
+    except Exception:
+        return False, 0, proxy_link, host
+
+async def check_all_proxies(proxies):
+    """Run checks in parallel."""
+    print(f"Checking {len(proxies)} proxies with Async Socket (PARALLEL)...")
+    
+    tasks = []
+    # Limit to MAX_PROXIES_TO_CHECK
+    for p in proxies[:MAX_PROXIES_TO_CHECK]:
+        tasks.append(check_proxy_socket(p))
+    
+    # Run all tasks concurrently
+    results = await asyncio.gather(*tasks)
+    
     working = []
     seen_ips = set()
     
-    loop = asyncio.get_event_loop()
-    
-    print(f"Checking first {MAX_PROXIES_TO_CHECK} proxies with Telethon...")
-    
-    for p in proxies[:MAX_PROXIES_TO_CHECK]:
-        is_working, latency = loop.run_until_complete(check_proxy_telethon(p))
-        if is_working:
-            parsed = parse_tg_link(p)
-            if parsed:
-                ip = parsed[0]
-                if ip not in seen_ips:
-                    print(f"✅ Works: {ip} ({latency:.0f}ms)")
-                    working.append((p, latency, ip))
-                    seen_ips.add(ip)
-                    
-        # Stop if we have enough fast proxies? No, checking 100 is fast enough
-        
+    for success, latency, link, ip in results:
+        if success and ip and ip not in seen_ips:
+            # print(f"✅ Works: {ip} ({latency:.0f}ms)")
+            working.append((link, latency, ip))
+            seen_ips.add(ip)
+            
     return working
 
 def format_telegram_link(proxy_str):
-    """Return the raw tg:// link since it is already formatted."""
+    """Return the raw tg:// link."""
     return proxy_str
 
 def send_telegram_message(message):
     """Send message to the user via Telegram Bot API."""
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Error: BOT_TOKEN or CHAT_ID not found in environment variables.")
+    # Using username since numeric ID was incorrect/failed
+    CHANNEL_ID = "@i9006ii" 
+    
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN not found.")
         return
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    # We use editMessageText because we want to update the SAME post forever
+    # But if we can't find it, we fallback to sending a new one (auto-recovery)
+    # The 'Eternal Post' ID is hardcoded here based on previous successful run
+    ETERNAL_MESSAGE_ID = 2 
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": CHANNEL_ID,
+        "message_id": ETERNAL_MESSAGE_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
@@ -133,19 +153,19 @@ def send_telegram_message(message):
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
-        print("Message sent successfully!")
+        print(f"Eternal Post (ID {ETERNAL_MESSAGE_ID}) updated successfully!")
     except Exception as e:
-        print(f"Error sending message: {e}")
+        print(f"Error editing message: {e}")
 
 def main():
     if not BOT_TOKEN:
         print("Skipping Telegram send: Secrets not set.")
-        # We allow running without secrets for testing fetching/checking logic locally
     
     raw_proxies = get_proxies()
     
-    # Run Checks
-    working_proxies = check_proxies_sync(raw_proxies)
+    # Run Async Checks
+    loop = asyncio.get_event_loop()
+    working_proxies = loop.run_until_complete(check_all_proxies(raw_proxies))
     
     # Sort strictly by latency (fastest first)
     working_proxies.sort(key=lambda x: x[1])
@@ -153,6 +173,8 @@ def main():
     if not working_proxies:
         print("No working proxies found.")
         return
+        
+    print(f"Found {len(working_proxies)} working proxies!")
 
     # Prepare message (Final User Version)
     current_time_msk = time.strftime('%d.%m.%Y в %H:%M по МСК')
