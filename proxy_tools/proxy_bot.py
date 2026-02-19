@@ -59,7 +59,38 @@ def check_proxy(proxy_str):
     
     try:
         start_time = time.time()
-        with socket.create_connection((host, port), timeout=CHECK_TIMEOUT):
+        # Create socket
+        with socket.create_connection((host, port), timeout=CHECK_TIMEOUT) as sock:
+            # Send simplified MTProto handshake (obfuscated header simulation)
+            # Real MTProto proxy expects 64 bytes of random data (or specific handshake)
+            # If it's a valid proxy, it should accept it and keep connection open or send data back
+            # If it's just a random open port, it might close or hang
+            
+            # We generate 64 bytes of random data
+            # Note: This is a heuristics check. A full MTProto handshake is complex.
+            # But sending random bytes usually triggers a response or stable connection on valid proxies.
+            random_payload = os.urandom(64)
+            sock.sendall(random_payload)
+            
+            # Wait for response (up to timeout)
+            # A valid proxy should NOT close immediately. It might not send data back without valid protocol,
+            # but it should stay connected. 
+            # OR better: we can try to read 1 byte. If it returns immediately with empty bytes -> Closed.
+            # If it timeouts -> Open (Good, but slow?).
+            # Actually, most "fake" proxies (e.g. HTTP on 443) will close or send HTTP error.
+            
+            try:
+                data = sock.recv(1)
+                # If we receive data, it's alive.
+                # If we receive NOTHING (b''), it closed connection -> Dead.
+                if not data:
+                    return False, 0
+            except socket.timeout:
+                # Timeout on recv is actually GOOD for some proxies (they wait for more data)
+                # But bad for others. 
+                # Let's count "connected and didn't close immediately" as success for now.
+                pass
+                
             latency = (time.time() - start_time) * 1000
             return True, latency
     except Exception:
