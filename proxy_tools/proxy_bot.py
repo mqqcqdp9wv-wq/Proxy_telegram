@@ -145,6 +145,8 @@ def main():
     print("\nGenerated Message:")
     print(message)
     
+    send_telegram_message(message)
+
 def send_telegram_message(message):
     """Send message to the user via Telegram Bot API."""
     # Using numeric ID for stability (immune to username changes)
