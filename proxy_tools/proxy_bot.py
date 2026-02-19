@@ -149,8 +149,8 @@ def main():
 
 def send_telegram_message(message):
     """Send message to the user via Telegram Bot API."""
-    # Using numeric ID for stability (immune to username changes)
-    CHANNEL_ID = "-1002347714881" 
+    # Using username since numeric ID was incorrect/failed
+    CHANNEL_ID = "@i9006ii" 
     
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not found.")
