@@ -4,14 +4,19 @@ import socket
 import time
 from urllib.parse import quote
 from urllib.parse import urlparse, parse_qs
+import asyncio
+from telethon import TelegramClient, connection
+from telethon.sessions import StringSession
 
 # Configuration
 PROXY_LIST_URL = "https://raw.githubusercontent.com/Argh94/Proxy-List/main/MTProto.txt"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-CHECK_TIMEOUT = 2  # Seconds to wait for a connection
-MAX_PROXIES_TO_CHECK = 200 # Check more proxies to find the absolute fastest
-MAX_PROXIES_TO_SEND = 5   # Send top 5
+# CHAT_ID is hardcoded in send_telegram_message, so we don't strictly need it here, but good practice
+CHAT_ID_ENV = os.environ.get("CHAT_ID") 
+
+CHECK_TIMEOUT = 5  # Seconds to wait for a connection
+MAX_PROXIES_TO_CHECK = 100 # Check fewer proxies but deeper
+MAX_PROXIES_TO_SEND = 5
 
 def get_proxies():
     """Fetch raw proxy list from GitHub."""
@@ -46,55 +51,66 @@ def parse_tg_link(link):
     except Exception:
         return None
 
-def check_proxy(proxy_str):
+async def check_proxy_telethon(proxy_link):
     """
-    Check if a proxy is alive.
-    Input: tg://proxy link
+    Check if a proxy works by trying to connect using Telethon.
     """
-    parsed = parse_tg_link(proxy_str)
+    parsed = parse_tg_link(proxy_link)
     if not parsed:
         return False, 0
     
-    host, port, _ = parsed
+    request_server, request_port, request_secret = parsed
+    
+    # Telethon proxy format
+    proxy = (connection.ConnectionTcpMTProxyRandomizedIntermediate, request_server, request_port, request_secret)
+    
+    # Use standard public API ID (not secret, widely used for open source)
+    api_id = 2040
+    api_hash = 'b18441a1ff607e10a989891a5462e627'
+    
+    client = TelegramClient(StringSession(), api_id, api_hash, proxy=proxy, timeout=CHECK_TIMEOUT)
     
     try:
         start_time = time.time()
-        # Create socket
-        with socket.create_connection((host, port), timeout=CHECK_TIMEOUT) as sock:
-            # Send simplified MTProto handshake (obfuscated header simulation)
-            # Real MTProto proxy expects 64 bytes of random data (or specific handshake)
-            # If it's a valid proxy, it should accept it and keep connection open or send data back
-            # If it's just a random open port, it might close or hang
+        await client.connect()
+        if await client.is_user_authorized() or not await client.is_user_authorized(): 
+            # We just care if connect() succeeded without error.
+            # Usually connect() returns successful if handshake is done.
+            # We can also try get_me() but that requires valid auth key which we don't have/want.
+            # Just 'connect()' verifies handshake and network.
+            pass
             
-            # We generate 64 bytes of random data
-            # Note: This is a heuristics check. A full MTProto handshake is complex.
-            # But sending random bytes usually triggers a response or stable connection on valid proxies.
-            random_payload = os.urandom(64)
-            sock.sendall(random_payload)
-            
-            # Wait for response (up to timeout)
-            # A valid proxy should NOT close immediately. It might not send data back without valid protocol,
-            # but it should stay connected. 
-            # OR better: we can try to read 1 byte. If it returns immediately with empty bytes -> Closed.
-            # If it timeouts -> Open (Good, but slow?).
-            # Actually, most "fake" proxies (e.g. HTTP on 443) will close or send HTTP error.
-            
-            try:
-                data = sock.recv(1)
-                # If we receive data, it's alive.
-                # If we receive NOTHING (b''), it closed connection -> Dead.
-                if not data:
-                    return False, 0
-            except socket.timeout:
-                # Timeout on recv is actually GOOD for some proxies (they wait for more data)
-                # But bad for others. 
-                # Let's count "connected and didn't close immediately" as success for now.
-                pass
-                
-            latency = (time.time() - start_time) * 1000
-            return True, latency
-    except Exception:
+        latency = (time.time() - start_time) * 1000
+        await client.disconnect()
+        return True, latency
+    except Exception as e:
+        # print(f"Failed: {request_server} - {e}")
+        await client.disconnect()
         return False, 0
+
+def check_proxies_sync(proxies):
+    """Wrapper to run async checks."""
+    working = []
+    seen_ips = set()
+    
+    loop = asyncio.get_event_loop()
+    
+    print(f"Checking first {MAX_PROXIES_TO_CHECK} proxies with Telethon...")
+    
+    for p in proxies[:MAX_PROXIES_TO_CHECK]:
+        is_working, latency = loop.run_until_complete(check_proxy_telethon(p))
+        if is_working:
+            parsed = parse_tg_link(p)
+            if parsed:
+                ip = parsed[0]
+                if ip not in seen_ips:
+                    print(f"✅ Works: {ip} ({latency:.0f}ms)")
+                    working.append((p, latency, ip))
+                    seen_ips.add(ip)
+                    
+        # Stop if we have enough fast proxies? No, checking 100 is fast enough
+        
+    return working
 
 def format_telegram_link(proxy_str):
     """Return the raw tg:// link since it is already formatted."""
@@ -122,29 +138,14 @@ def send_telegram_message(message):
         print(f"Error sending message: {e}")
 
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
+    if not BOT_TOKEN:
         print("Skipping Telegram send: Secrets not set.")
         # We allow running without secrets for testing fetching/checking logic locally
     
     raw_proxies = get_proxies()
-    working_proxies = [] # List of tuples: (proxy_str, latency, ip)
-    seen_ips = set()
-
-    print(f"Checking first {MAX_PROXIES_TO_CHECK} proxies for best ping...")
     
-    # Check more candidates to find low latency ones
-    for p in raw_proxies[:MAX_PROXIES_TO_CHECK]:
-        is_working, latency = check_proxy(p)
-        if is_working:
-            parsed = parse_tg_link(p)
-            if parsed:
-                ip = parsed[0]
-                if ip not in seen_ips:
-                    # print(f"✅ Works: {ip} ({latency:.0f}ms)")
-                    working_proxies.append((p, latency, ip))
-                    seen_ips.add(ip)
-        
-        # We don't break early anymore, we want to check the full sample to find the FASTEST
+    # Run Checks
+    working_proxies = check_proxies_sync(raw_proxies)
     
     # Sort strictly by latency (fastest first)
     working_proxies.sort(key=lambda x: x[1])
