@@ -145,23 +145,24 @@ def main():
     print("\nGenerated Message:")
     print(message)
     
-    edit_telegram_message(message)
-
-def edit_telegram_message(message):
-    """Edit the specific message in the channel."""
-    # Channel: https://t.me/i9006ii -> @i9006ii
-    # Message ID: 2
-    CHANNEL_USERNAME = "@i9006ii"
-    MESSAGE_ID = 2
+def send_telegram_message(message):
+    """Send message to the user via Telegram Bot API."""
+    # Using numeric ID for stability (immune to username changes)
+    CHANNEL_ID = "-1002347714881" 
     
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not found.")
         return
+
+    # We use editMessageText because we want to update the SAME post forever
+    # But if we can't find it, we fallback to sending a new one (auto-recovery)
+    # The 'Eternal Post' ID is hardcoded here based on previous successful run
+    ETERNAL_MESSAGE_ID = 3 
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {
-        "chat_id": CHANNEL_USERNAME,
-        "message_id": MESSAGE_ID,
+        "chat_id": CHANNEL_ID,
+        "message_id": ETERNAL_MESSAGE_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
@@ -170,38 +171,12 @@ def edit_telegram_message(message):
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
-        print("Message edited successfully!")
+        print(f"Eternal Post (ID {ETERNAL_MESSAGE_ID}) updated successfully!")
     except Exception as e:
         print(f"Error editing message: {e}")
-        print("Attempting to SEND a new message instead...")
-        send_telegram_message(message)
-
-def send_telegram_message(message):
-    """Send message to the user via Telegram Bot API."""
-    CHANNEL_USERNAME = "@i9006ii"
-    
-    if not BOT_TOKEN:
-        print("Error: BOT_TOKEN not found.")
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHANNEL_USERNAME,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        print("New message sent successfully!")
-        result = response.json()
-        new_msg_id = result.get('result', {}).get('message_id')
-        print(f" IMPORTANT: New Message ID is: {new_msg_id}")
-        print(f" PLEASE UPDATE THE SCRIPT WITH MESSAGE_ID = {new_msg_id}")
-    except Exception as e:
-        print(f"Error sending message: {e}")
+        # Only if really necessary, we could uncomment this to send a new one
+        # print("Attempting to SEND a new message instead...")
+        # send_new_message(message, CHANNEL_ID)
 
 
 if __name__ == "__main__":
